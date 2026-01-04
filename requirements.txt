@@ -1,0 +1,9 @@
+streamlit
+biopython
+python-dotenv
+langchain>=0.2.19
+langchain-communities
+transformers
+sentence-transformers
+torch
+chromadb
