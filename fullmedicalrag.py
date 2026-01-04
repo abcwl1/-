@@ -1,24 +1,15 @@
 # === Streamlit + LCEL + RAG + 上下文记忆 ===
 
 # === 1️⃣ 导入必要库 ===
-#导入embedding
-from langchain_community.embeddings import HuggingFaceEmbeddings
-#导入向量数据库chroma
+from langchain_community.embeddings import HuggingFaceEmbedding
 from langchain_community.vectorstores import Chroma
-#llm
 from langchain_openai import ChatOpenAI
-#导入环境变量
 import os
-#将自定义prompt转为lcel链中所需的promptTemplate
 from langchain_core.prompts import ChatPromptTemplate
-#lcel链所需
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableParallel
-#StrOutputParser 将任何输入转换/解析为字符串
 from langchain_core.output_parsers import StrOutputParser
-#streamlit
 import streamlit as st
 
-#
 from medicalrag import PubMedFetcher, MedicalRAGBuilder, MedicalQASystem
 
 # ---------------------------
@@ -26,7 +17,7 @@ from medicalrag import PubMedFetcher, MedicalRAGBuilder, MedicalQASystem
 # ---------------------------
 
 # 向量库路径
-VECTORSTORE_PATH = "D:/llm/rag/chroma_db"
+VECTORSTORE_PATH = ""
 
 # 初始化 RAG
 rag = MedicalRAGBuilder()
@@ -80,3 +71,4 @@ if st.checkbox("显示聊天历史"):
 
 
     
+
