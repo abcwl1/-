@@ -1,12 +1,3 @@
-#有需要的环境变量，所以先： cd /d D:/llm/rag
-
-
-#1.文件获取：PubMed API 
-#向量化embedded模型
-#LLM 做“文献综述 / 问答”
-
-#使用搭建好的向量数据库，对 query 查询问题进行召回，并将召回结果和 query 结合起来构建 prompt，输入到大模型中进行问答。
-
 #1
 from Bio import Entrez
 import time
@@ -67,44 +58,17 @@ class PubMedFetcher:
             if 'LastName' in author and 'Initials' in author:
                 authors.append(f"{author['LastName']} {author['Initials']}")
         return ", ".join(authors) + (" et al." if len(author_list) > 3 else "")
-# 使用示例
-"""
-if __name__ == "__main__":
-    fetcher = PubMedFetcher(email="your.email@example.com")
-    # 搜索阿尔茨海默症相关文献
-    pmids = fetcher.search_papers("Alzheimer's disease treatment", max_results=50)
-    papers = fetcher.fetch_abstracts(pmids)
-    print(f"\n 共获取 {len(papers)} 篇文献")
-        print(" 答案:")
-"""
-
-
-
 
 #2
-#导入embedding
 from langchain_community.embeddings import HuggingFaceEmbeddings
-#导入文本分割器
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-#导入Document
 from langchain_core.documents import Document 
-#导入向量数据库chroma
 from langchain_community.vectorstores import Chroma
-
-#导入类型注解
 from typing import List, Dict
 
 class MedicalRAGBuilder:
     def __init__(self, 
-                 embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        """
-        初始化RAG
-        Args:
-            embedding_model: 可选模型
-                - sentence-transformers/all-MiniLM-L6-v2 (快速，英文)
-                - BAAI/bge-large-zh-v1.5 (中文优化)
-                - text-embedding-ada-002 (OpenAI，最佳效果)
-        """
+                 embedding_model: str = ""):
         print(f" 加载Embedding模型: {embedding_model}")
         #embedding模型
         self.embeddings = HuggingFaceEmbeddings(
@@ -124,7 +88,7 @@ class MedicalRAGBuilder:
 #!rm -rf './chroma_db'  # 删除旧的数据库文件（如果文件夹中有文件的话），windows电脑请手动删除
     def build_vectorstore(self, papers: List[Dict], 
                           #定义持久化路径persist_directory
-                          persist_directory: str = "D:/llm/ragchroma_db"):
+                          persist_directory: str = ""):
         """构建向量数据库"""
         documents = []
         for paper in papers:
@@ -162,7 +126,7 @@ class MedicalRAGBuilder:
         print(f"向量库中存储的数量：{self.vectorstore._collection.count()}")
         print(f"✅ 向量数据库已保存到: {persist_directory}")
     def load_vectorstore(self, 
-                         persist_directory: str = "./chroma_db"):
+                         persist_directory: str = ""):
         """加载已有的向量数据库"""
         self.vectorstore = Chroma(
             persist_directory=persist_directory,
@@ -188,8 +152,6 @@ class MedicalRAGBuilder:
             print(f"   来源: {doc.metadata['source']}\n")
         return results
 
-
-#防止AI胡编PMID：把 胡编的 替换为 [引用验证失败]
 # 防止AI生成的答案中引用的PMID不存在
 def verify_citations(answer: str, source_docs: List) -> str:
     """验证并修正引用"""
@@ -203,26 +165,14 @@ def verify_citations(answer: str, source_docs: List) -> str:
             answer = answer.replace(f"PMID: {pmid}", "[引用验证失败]")
     return answer
 
-
-
 #3.
-#llm
 from langchain_openai import ChatOpenAI
-#将自定义prompt转为lcel链中所需的promptTemplate
 from langchain_core.prompts import PromptTemplate
-#lcel链所需
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableParallel
-# StrOutputParser 将任何输入转换/解析为字符串
 from langchain_core.output_parsers import StrOutputParser
-
-#环境变量：键值对形式
-# dotenv: 用于从 .env 文件中读取项目的环境变量
-# find_dotenv()寻找并定位.env文件的路径
-# load_dotenv()读取该.env文件，并将其中的环境变量加载到当前的运行环境中  
 import os
 from dotenv import load_dotenv, find_dotenv
-load_dotenv(find_dotenv())  # 读取 .env
-#os.environ['xx']获取环境变量xx的值
+load_dotenv(find_dotenv())  
 
 class MedicalQASystem:
     def __init__(self, vectorstore):
@@ -233,21 +183,12 @@ class MedicalQASystem:
         self.vectorstore = vectorstore
 
         #⭐构建检索问答链
-        #通过as_retriever方法把向量数据库构造成检索器。我们使用一个问题 query 进行向量检索。
-        # 如下代码会在向量数据库中根据相似性进行检索，返回前 k 个与query最相似的文档。
         #question = ""
-        
         retriever = self.vectorstore.as_retriever(search_kwargs={"k": 3})
-        
         #docs = retriever.invoke(question)
         #print(f"检索到的内容数：{len(docs)}")
         #for i, doc in enumerate(docs):
            #print(f"检索到的第{i}个内容: \n {doc.page_content}", end="\n-------------\n")
-        
-        """
-        LCEL中要求所有的组成元素都是Runnable类型，前面我们见过的ChatModel、PromptTemplate等都是继承自Runnable类。
-        链：由|符号串连，数据从左向右传递。
-"""
         #⭐配置LLM
         """
         self.llm = OpenAI(
@@ -256,8 +197,8 @@ class MedicalQASystem:
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )"""
         model_name = os.environ['MODEL_NAME']
-        api_key = os.environ['API_KEY']  # Ollama 不验证，可以是任意值
-        base_url = os.environ['BASE_URL']  # 默认 Ollama 地址
+        api_key = os.environ['API_KEY'] 
+        base_url = os.environ['BASE_URL'] 
         # print(f"MODEL_NAME={model_name}, API={api_key}, BASE_URL={base_url}")
         self.llm = ChatOpenAI(
             model=model_name,
@@ -265,15 +206,7 @@ class MedicalQASystem:
             openai_api_key=api_key,      
             openai_api_base=base_url
         )
-        #尝试使用：llm.invoke("请你自我介绍一下自己！").content
-        #但大多数情况下不会直接将用户的输入直接传递给 LLM。
-        # 通常，他们会将用户输入添加到一个较大的文本中，称为提示模板，
-        # 该文本提供有关当前特定任务的附加上下文。 即
         # ⭐PromptTemplates👇
-
-        # Ⅰ 先定制个性化template：医学问答Prompt
-        # 优化：在Prompt中添加领域限定，防止歧义
-        # eg"MI"可能是心肌梗死(Myocardial Infarction)或机器智能(Machine Intelligence)
         self.template = """你是一位专业的医学文献分析助手。请基于以下文献内容回答问题。
 要求：
 1. 答案必须基于提供的文献内容
@@ -285,11 +218,8 @@ class MedicalQASystem:
 {context}
 问题：{question}
 请给出详细的答案："""
-        # Ⅱ 然后将template通过 PromptTemplate 转为可以在LCEL中使用的类型
         self.prompt = PromptTemplate(template=self.template)
-
         #⭐构建QA链
-        #输入问题作为prompt的input，用Passthrough作为占位
         self.qa_chain = (
     RunnableParallel(
         {
@@ -315,9 +245,6 @@ class MedicalQASystem:
     )
 )
 
-
-      
-
     def ask(self, question: str) :# -> Dict
         """
         提问并获取答案（检索问答链 效果测试）
@@ -329,7 +256,6 @@ class MedicalQASystem:
         """
         print(f"\n 问题: {question}\n")
         print(" AI正在思考...\n")
-        #question传给RunnablePassthrough()，即上面链里的question=这里的question
         self.result = self.qa_chain.invoke(question)
         
         self.answer = self.result["answer"]
@@ -344,8 +270,6 @@ class MedicalQASystem:
         print("-" * 80)
         print("\n 参考文献:")
         for i, doc in enumerate(self.source_docs, 1):
-            #如果 metadata 里有 "title" → 用它
-            #如果 没有 → 用 "Unknown title"
             title = doc.metadata.get("title", "Unknown title")
             pmid = doc.metadata.get("pmid", "Unknown PMID")
             source = doc.metadata.get("source", "Unknown source")
@@ -358,9 +282,6 @@ class MedicalQASystem:
             'sources': [doc.metadata for doc in self.source_docs]
         }
     
-
-
-
 #完整流程
 if __name__ == "__main__":
     # Step 1: 获取文献
