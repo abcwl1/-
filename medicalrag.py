@@ -1,0 +1,389 @@
+#有需要的环境变量，所以先： cd /d D:/llm/rag
+
+
+#1.文件获取：PubMed API 
+#向量化embedded模型
+#LLM 做“文献综述 / 问答”
+
+#使用搭建好的向量数据库，对 query 查询问题进行召回，并将召回结果和 query 结合起来构建 prompt，输入到大模型中进行问答。
+
+#1
+from Bio import Entrez
+import time
+from typing import List, Dict
+class PubMedFetcher:
+    def __init__(self, email: str):
+        Entrez.email = email
+    def search_papers(self, query: str, max_results: int = 100) -> List[str]:
+        """搜索文献返回PMID列表"""
+        handle = Entrez.esearch(
+            db="pubmed",
+            term=query,
+            retmax=max_results,
+            sort="relevance"
+        )
+        record = Entrez.read(handle)
+        handle.close()
+        return record["IdList"]
+    def fetch_abstracts(self, pmid_list: List[str]) -> List[Dict]:
+        """批量获取摘要"""
+        papers = []
+        # 分批处理（避免API限流）
+        batch_size = 10
+        for i in range(0, len(pmid_list), batch_size):
+            batch = pmid_list[i:i+batch_size]
+            handle = Entrez.efetch(
+                db="pubmed",
+                id=",".join(batch),
+                rettype="abstract",
+                retmode="xml"
+            )
+            records = Entrez.read(handle)
+            handle.close()
+            for article in records['PubmedArticle']:
+                try:
+                    medline = article['MedlineCitation']
+                    article_data = medline['Article']
+                    # 提取关键信息
+                    paper = {
+                        'pmid': str(medline['PMID']),
+                        'title': article_data['ArticleTitle'],
+                        'abstract': article_data.get('Abstract', {}).get('AbstractText', [''])[0],
+                        'journal': article_data['Journal']['Title'],
+                        'year': article_data['Journal']['JournalIssue'].get('PubDate', {}).get('Year', 'N/A'),
+                        'authors': self._extract_authors(article_data.get('AuthorList', []))
+                    }
+                    if paper['abstract']:  # 只保留有摘要的
+                        papers.append(paper)
+                        print(f"✅ 获取: {paper['title'][:50]}...")
+                except Exception as e:
+                    print(f"❌ 解析失败: {e}")
+            time.sleep(0.5)  # 避免限流
+        return papers
+    def _extract_authors(self, author_list) -> str:
+        """提取作者名"""
+        authors = []
+        for author in author_list[:3]:  # 只取前3位
+            if 'LastName' in author and 'Initials' in author:
+                authors.append(f"{author['LastName']} {author['Initials']}")
+        return ", ".join(authors) + (" et al." if len(author_list) > 3 else "")
+# 使用示例
+"""
+if __name__ == "__main__":
+    fetcher = PubMedFetcher(email="your.email@example.com")
+    # 搜索阿尔茨海默症相关文献
+    pmids = fetcher.search_papers("Alzheimer's disease treatment", max_results=50)
+    papers = fetcher.fetch_abstracts(pmids)
+    print(f"\n 共获取 {len(papers)} 篇文献")
+        print(" 答案:")
+"""
+
+
+
+
+#2
+#导入embedding
+from langchain_community.embeddings import HuggingFaceEmbeddings
+#导入文本分割器
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+#导入Document
+from langchain_core.documents import Document 
+#导入向量数据库chroma
+from langchain_community.vectorstores import Chroma
+
+#导入类型注解
+from typing import List, Dict
+
+class MedicalRAGBuilder:
+    def __init__(self, 
+                 embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        """
+        初始化RAG
+        Args:
+            embedding_model: 可选模型
+                - sentence-transformers/all-MiniLM-L6-v2 (快速，英文)
+                - BAAI/bge-large-zh-v1.5 (中文优化)
+                - text-embedding-ada-002 (OpenAI，最佳效果)
+        """
+        print(f" 加载Embedding模型: {embedding_model}")
+        #embedding模型
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=embedding_model, 
+            model_kwargs={'device': 'cpu'}  # 如果有GPU改为'cuda'
+        )
+        #文本分割器
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            #递归字符分割：按不同的字符递归地分割(按照separators中的优先级:"\n\n", "\n", "." , ……)
+            chunk_size=500,  # 每个chunk大小
+            chunk_overlap=50,  # 相邻chunk之间的重叠字符数，防止上下文丢失
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""] #分隔符字符串数组
+        )
+        #向量数据库
+        self.vectorstore = None
+
+#!rm -rf './chroma_db'  # 删除旧的数据库文件（如果文件夹中有文件的话），windows电脑请手动删除
+    def build_vectorstore(self, papers: List[Dict], 
+                          #定义持久化路径persist_directory
+                          persist_directory: str = "D:/llm/ragchroma_db"):
+        """构建向量数据库"""
+        documents = []
+        for paper in papers:
+            # 构造文档内容
+            content = f"Title: {paper['title']}\n\n"
+            content += f"PMID: {paper['pmid']}\n\n"
+            content += f"Abstract: {paper['abstract']}\n\n"
+            content += f"Journal: {paper['journal']} ({paper['year']})\n"
+            content += f"Authors: {paper['authors']}"
+            # 创建Document对象: from langchain_core.documents import Document
+            doc = Document(
+                #内容page_content
+                page_content=content,
+                #描述性数据metadata
+                metadata={
+                    'pmid': paper['pmid'],
+                    'title': paper['title'],
+                    'year': paper['year'],
+                    'source': f"https://pubmed.ncbi.nlm.nih.gov/{paper['pmid']}/"
+                }
+            )
+            documents.append(doc)
+        print(f" 准备对 {len(documents)} 篇文献进行向量化...")
+
+        # 分割文本
+        split_docs = self.text_splitter.split_documents(documents)
+        print(f"✂️ 分割为 {len(split_docs)} 个文本块")
+        # 向量数据库
+        self.vectorstore = Chroma.from_documents(
+            documents=split_docs,
+            embedding=self.embeddings,
+            persist_directory=persist_directory
+        )
+        self.vectorstore.persist()
+        print(f"向量库中存储的数量：{self.vectorstore._collection.count()}")
+        print(f"✅ 向量数据库已保存到: {persist_directory}")
+    def load_vectorstore(self, 
+                         persist_directory: str = "./chroma_db"):
+        """加载已有的向量数据库"""
+        self.vectorstore = Chroma(
+            persist_directory=persist_directory,
+            embedding_function=self.embeddings
+        )
+        print(f"✅ 向量数据库已加载")
+#向量检索
+#当你需要数据库返回严谨的 按余弦相似度排序的结果 时可以使用similarity_search函数。
+    def similarity_search(self, query: str, k: int = 5):
+        """相似度检索"""
+        if not self.vectorstore:
+            raise ValueError("请先构建或加载向量数据库")
+        #返回按余弦相似度排序的前k个文献片段
+        results = self.vectorstore.similarity_search_with_score(query, k=k)
+        print(f"\n 检索问题: {query}")
+        print(f" 找到 {len(results)} 个相关文献片段:\n")
+
+        for i, (doc, score) in enumerate(results):
+            print(f"检索到的第{i}个文献片段的: \n")
+            print(f"   相似度: {score:.4f}")
+            print(f"   标题: {doc.metadata['title']}")
+            print(f"   内容: {doc.page_content[:200]}...")
+            print(f"   来源: {doc.metadata['source']}\n")
+        return results
+
+
+#防止AI胡编PMID：把 胡编的 替换为 [引用验证失败]
+# 防止AI生成的答案中引用的PMID不存在
+def verify_citations(answer: str, source_docs: List) -> str:
+    """验证并修正引用"""
+    valid_pmids = [doc.metadata['pmid'] for doc in source_docs]
+    # 提取答案中的PMID
+    import re
+    mentioned_pmids = re.findall(r'PMID:\s*(\d+)', answer)
+    # 过滤无效引用
+    for pmid in mentioned_pmids:
+        if pmid not in valid_pmids:
+            answer = answer.replace(f"PMID: {pmid}", "[引用验证失败]")
+    return answer
+
+
+
+#3.
+#llm
+from langchain_openai import ChatOpenAI
+#将自定义prompt转为lcel链中所需的promptTemplate
+from langchain_core.prompts import PromptTemplate
+#lcel链所需
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableParallel
+# StrOutputParser 将任何输入转换/解析为字符串
+from langchain_core.output_parsers import StrOutputParser
+
+#环境变量：键值对形式
+# dotenv: 用于从 .env 文件中读取项目的环境变量
+# find_dotenv()寻找并定位.env文件的路径
+# load_dotenv()读取该.env文件，并将其中的环境变量加载到当前的运行环境中  
+import os
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())  # 读取 .env
+#os.environ['xx']获取环境变量xx的值
+
+class MedicalQASystem:
+    def __init__(self, vectorstore):
+        """
+        初始化问答系统
+        Args:model_name: 可选
+        """
+        self.vectorstore = vectorstore
+
+        #⭐构建检索问答链
+        #通过as_retriever方法把向量数据库构造成检索器。我们使用一个问题 query 进行向量检索。
+        # 如下代码会在向量数据库中根据相似性进行检索，返回前 k 个与query最相似的文档。
+        #question = ""
+        
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": 3})
+        
+        #docs = retriever.invoke(question)
+        #print(f"检索到的内容数：{len(docs)}")
+        #for i, doc in enumerate(docs):
+           #print(f"检索到的第{i}个内容: \n {doc.page_content}", end="\n-------------\n")
+        
+        """
+        LCEL中要求所有的组成元素都是Runnable类型，前面我们见过的ChatModel、PromptTemplate等都是继承自Runnable类。
+        链：由|符号串连，数据从左向右传递。
+"""
+        #⭐配置LLM
+        """
+        self.llm = OpenAI(
+            model_name=model_name,
+            temperature=0.3,  # 降低随机性，提高准确度
+            openai_api_key=os.getenv("OPENAI_API_KEY")
+        )"""
+        model_name = os.environ['MODEL_NAME']
+        api_key = os.environ['API_KEY']  # Ollama 不验证，可以是任意值
+        base_url = os.environ['BASE_URL']  # 默认 Ollama 地址
+        # print(f"MODEL_NAME={model_name}, API={api_key}, BASE_URL={base_url}")
+        self.llm = ChatOpenAI(
+            model=model_name,
+            temperature=0.3,                      # temperature↓，随机性减少
+            openai_api_key=api_key,      
+            openai_api_base=base_url
+        )
+        #尝试使用：llm.invoke("请你自我介绍一下自己！").content
+        #但大多数情况下不会直接将用户的输入直接传递给 LLM。
+        # 通常，他们会将用户输入添加到一个较大的文本中，称为提示模板，
+        # 该文本提供有关当前特定任务的附加上下文。 即
+        # ⭐PromptTemplates👇
+
+        # Ⅰ 先定制个性化template：医学问答Prompt
+        # 优化：在Prompt中添加领域限定，防止歧义
+        # eg"MI"可能是心肌梗死(Myocardial Infarction)或机器智能(Machine Intelligence)
+        self.template = """你是一位专业的医学文献分析助手。请基于以下文献内容回答问题。
+要求：
+1. 答案必须基于提供的文献内容
+2. 引用具体的PMID和文献标题
+3. 如果文献中没有相关信息，明确说明
+4. 使用专业但易懂的语言
+5. 注意：所有缩写按医学术语解释（如MI=心肌梗死）
+文献内容：
+{context}
+问题：{question}
+请给出详细的答案："""
+        # Ⅱ 然后将template通过 PromptTemplate 转为可以在LCEL中使用的类型
+        self.prompt = PromptTemplate(template=self.template)
+
+        #⭐构建QA链
+        #输入问题作为prompt的input，用Passthrough作为占位
+        self.qa_chain = (
+    RunnableParallel(
+        {
+            "docs": retriever,
+            "question": RunnablePassthrough()
+        }
+    )
+    | RunnableParallel(
+        {
+            "answer": (
+                RunnableLambda(
+                    lambda x: {
+                        "context": "\n\n".join(d.page_content for d in x["docs"]),
+                        "question": x["question"],
+                    }
+                )
+                | self.prompt
+                | self.llm
+                | StrOutputParser()
+            ),
+            "source_docs": lambda x: x["docs"],
+        }
+    )
+)
+
+
+      
+
+    def ask(self, question: str) :# -> Dict
+        """
+        提问并获取答案（检索问答链 效果测试）
+        Returns:
+            {
+                'answer': str,
+                'sources': List[Dict]
+            }
+        """
+        print(f"\n 问题: {question}\n")
+        print(" AI正在思考...\n")
+        #question传给RunnablePassthrough()，即上面链里的question=这里的question
+        self.result = self.qa_chain.invoke(question)
+        
+        self.answer = self.result["answer"]
+        self.source_docs = self.result["source_docs"]
+        #优化：验证引用的PMID是否真实存在
+        self.valid_answer = verify_citations(self.answer, self.source_docs)
+        
+        # 格式化输出
+        print(" 答案:")
+        print("-" * 80)
+        print(self.valid_answer)
+        print("-" * 80)
+        print("\n 参考文献:")
+        for i, doc in enumerate(self.source_docs, 1):
+            #如果 metadata 里有 "title" → 用它
+            #如果 没有 → 用 "Unknown title"
+            title = doc.metadata.get("title", "Unknown title")
+            pmid = doc.metadata.get("pmid", "Unknown PMID")
+            source = doc.metadata.get("source", "Unknown source")
+            print(f"\n[{i}] {title}")
+            print(f"    PMID: {pmid}")
+            print(f"    来源: {source}")
+
+        return {
+            'answer': self.valid_answer,
+            'sources': [doc.metadata for doc in self.source_docs]
+        }
+    
+
+
+
+#完整流程
+if __name__ == "__main__":
+    # Step 1: 获取文献
+    fetcher = PubMedFetcher(email="eyl998600@gmail.com")
+    pmids = fetcher.search_papers("Alzheimer's disease treatment 2023", max_results=50)
+    papers = fetcher.fetch_abstracts(pmids)
+    # Step 2: 构建向量数据库
+    rag = MedicalRAGBuilder()
+    #rag.build_vectorstore(papers, persist_directory="./chroma_db")
+    if os.path.exists("./chroma_db"):
+       rag.load_vectorstore()
+    else: #否则每次运行都会重新建库
+       rag.build_vectorstore(papers)
+    # Step 3: 创建问答系统
+    qa_system = MedicalQASystem(rag.vectorstore)
+    # Step 4: 提问
+    questions = [
+        "What are the most promising treatments for Alzheimer's disease in 2023?",
+        "What is the mechanism of action of aducanumab?",
+        "Are there any clinical trials showing positive results?"
+    ]
+    for q in questions:
+        qa_system.ask(q)
+        print("\n" + "="*100 + "\n")
+    
+
